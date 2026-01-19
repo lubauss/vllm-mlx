@@ -16,6 +16,31 @@ from ..api.tool_calling import convert_tools_for_template
 logger = logging.getLogger(__name__)
 
 
+class MLLMModelWrapper:
+    """
+    Wrapper for MLLM models to make them compatible with BatchGenerator.
+
+    BatchGenerator expects model output to be subscriptable (logits array),
+    but MLLM models return LanguageModelOutput objects. This wrapper extracts
+    the logits from the output.
+    """
+
+    def __init__(self, model):
+        self._model = model
+
+    def __call__(self, *args, **kwargs):
+        """Call the model and extract logits from LanguageModelOutput."""
+        output = self._model(*args, **kwargs)
+        # If output has logits attribute, return just the logits
+        if hasattr(output, 'logits'):
+            return output.logits
+        return output
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped model."""
+        return getattr(self._model, name)
+
+
 class BatchedEngine(BaseEngine):
     """
     Batched engine for continuous batching.
@@ -82,7 +107,9 @@ class BatchedEngine(BaseEngine):
                 trust_remote_code=self._trust_remote_code,
             )
             mllm.load()
-            self._model = mllm.model
+            # Wrap MLLM model so BatchGenerator can use it
+            # (MLLM returns LanguageModelOutput, BatchGenerator expects logits)
+            self._model = MLLMModelWrapper(mllm.model)
             self._tokenizer = mllm.processor
         else:
             from ..utils.tokenizer import load_model_with_fallback
