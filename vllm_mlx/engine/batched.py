@@ -177,15 +177,24 @@ class BatchedEngine(BaseEngine):
         from ..scheduler import SchedulerConfig
         import os
 
-        # Auto-configure Gemma 3 for continuous batching compatibility
-        # Gemma 3's RotatingKVCache with sliding_window causes garbled output
-        # in batch mode due to offset tracking corruption. Force full KVCache.
-        if self._is_mllm and ("gemma-3" in self._model_name.lower() or "gemma3" in self._model_name.lower()):
-            if os.environ.get("GEMMA3_SLIDING_WINDOW") is None:
-                os.environ["GEMMA3_SLIDING_WINDOW"] = "0"
+        # Note on Gemma 3 sliding window configuration:
+        # - Default sliding_window=1024 works for multimodal (image+text)
+        # - GEMMA3_SLIDING_WINDOW=0 (full KVCache) enables extended text context
+        #   but BREAKS multimodal generation with longer prompts (~1300+ tokens)
+        #
+        # Do NOT auto-set GEMMA3_SLIDING_WINDOW=0 for MLLM models.
+        # Users who need extended text-only context can manually set:
+        #   GEMMA3_SLIDING_WINDOW=0 (but avoid multimodal with long prompts)
+        if ("gemma-3" in self._model_name.lower() or "gemma3" in self._model_name.lower()):
+            sliding_window = os.environ.get("GEMMA3_SLIDING_WINDOW")
+            if sliding_window is not None:
                 logger.info(
-                    "Auto-set GEMMA3_SLIDING_WINDOW=0 for continuous batching compatibility. "
-                    "This uses full KVCache for all layers (~35GB at 50K tokens)."
+                    f"Gemma 3: Using GEMMA3_SLIDING_WINDOW={sliding_window} "
+                    f"(Note: value 0 may cause issues with multimodal + long prompts)"
+                )
+            else:
+                logger.info(
+                    "Gemma 3: Using default sliding_window=1024 (optimal for multimodal)"
                 )
 
         # Load model and tokenizer
