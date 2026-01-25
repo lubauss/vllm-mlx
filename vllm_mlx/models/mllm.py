@@ -18,17 +18,19 @@ import base64
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
-from typing import Iterator, Optional, Set, Union
+from typing import Iterator, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 import numpy as np
 import requests
 
-from vllm_mlx.vlm_cache import VLMCacheManager
+from vllm_mlx.vlm_cache import VLMPrefixCacheManager, VLMCacheManager
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +113,6 @@ MAX_BASE64_VIDEO_LENGTH = 700 * 1024 * 1024  # 700 MB base64 string (~500 MB dec
 
 class FileSizeExceededError(Exception):
     """Raised when a downloaded file exceeds the size limit."""
-
     pass
 
 
@@ -152,9 +153,7 @@ def is_base64_video(s: str) -> bool:
     return s.startswith("data:video/")
 
 
-def decode_base64_image(
-    base64_string: str, max_length: int = MAX_BASE64_IMAGE_LENGTH
-) -> bytes:
+def decode_base64_image(base64_string: str, max_length: int = MAX_BASE64_IMAGE_LENGTH) -> bytes:
     """
     Decode base64 image to bytes.
 
@@ -203,9 +202,7 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
-        )
+        head_response = requests.head(url, timeout=timeout, headers=headers, allow_redirects=True, verify=True)
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
             raise FileSizeExceededError(
@@ -216,9 +213,7 @@ def download_image(url: str, timeout: int = 30, max_size: int = MAX_IMAGE_SIZE) 
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
-    )
+    response = requests.get(url, timeout=timeout, headers=headers, stream=True, verify=True)
     response.raise_for_status()
 
     # Check Content-Length header from GET response
@@ -293,9 +288,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
 
     # First, make a HEAD request to check Content-Length
     try:
-        head_response = requests.head(
-            url, timeout=timeout, headers=headers, allow_redirects=True, verify=True
-        )
+        head_response = requests.head(url, timeout=timeout, headers=headers, allow_redirects=True, verify=True)
         content_length = head_response.headers.get("content-length")
         if content_length and int(content_length) > max_size:
             raise FileSizeExceededError(
@@ -306,9 +299,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
         # HEAD request failed, proceed with GET and check during download
         pass
 
-    response = requests.get(
-        url, timeout=timeout, headers=headers, stream=True, verify=True
-    )
+    response = requests.get(url, timeout=timeout, headers=headers, stream=True, verify=True)
     response.raise_for_status()
 
     # Check Content-Length header from GET response
@@ -367,9 +358,7 @@ def download_video(url: str, timeout: int = 120, max_size: int = MAX_VIDEO_SIZE)
     return _temp_manager.register(temp_file.name)
 
 
-def decode_base64_video(
-    base64_string: str, max_length: int = MAX_BASE64_VIDEO_LENGTH
-) -> str:
+def decode_base64_video(base64_string: str, max_length: int = MAX_BASE64_VIDEO_LENGTH) -> str:
     """
     Decode base64 video to temp file and return path.
 
@@ -692,10 +681,10 @@ class MLXMultimodalLM:
         self.config = None
         self._loaded = False
 
-        # Initialize VLM cache manager
-        self._cache_manager: Optional[VLMCacheManager] = None
+        # Initialize VLM prefix cache manager (with vision embedding caching)
+        self._cache_manager: Optional[VLMPrefixCacheManager] = None
         if enable_cache:
-            self._cache_manager = VLMCacheManager(max_entries=cache_size)
+            self._cache_manager = VLMPrefixCacheManager(max_entries=cache_size)
 
     def load(self) -> None:
         """Load the model and processor."""
@@ -864,7 +853,7 @@ class MLXMultimodalLM:
         prompt_cache = None
         cache_hit = False
 
-        if use_cache and self._cache_manager and all_sources:
+        if use_cache and self._cache_manager is not None and all_sources:
             prompt_cache, cache_hit = self._cache_manager.fetch_cache(
                 all_sources, formatted_prompt
             )
@@ -1036,6 +1025,13 @@ class MLXMultimodalLM:
         images = []
         videos = []
         text_prompt = ""
+        
+        logger.info(f"MLLM.chat() called with {len(messages)} messages")
+        for i, msg in enumerate(messages):
+            logger.info(f"  Message {i}: role={msg.get('role')}, content type={type(msg.get('content'))}")
+            if isinstance(msg.get('content'), list):
+                for j, item in enumerate(msg.get('content', [])):
+                    logger.info(f"    Item {j}: type={item.get('type') if isinstance(item, dict) else type(item)}")
 
         for msg in messages:
             role = msg.get("role", "user")
@@ -1048,7 +1044,7 @@ class MLXMultimodalLM:
                 # OpenAI multimodal format
                 for item in content:
                     if isinstance(item, str):
-                        text_prompt = item
+                        text_prompt += item
                         continue
 
                     # Convert Pydantic models to dicts
@@ -1061,7 +1057,7 @@ class MLXMultimodalLM:
                         item_type = item.get("type", "")
 
                         if item_type == "text":
-                            text_prompt = item.get("text", "")
+                            text_prompt += item.get("text", "")
 
                         elif item_type == "image_url":
                             img_url = item.get("image_url", {})
@@ -1103,7 +1099,90 @@ class MLXMultimodalLM:
             logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
             formatted_prompt = text_prompt
 
-        # Generate using mlx_vlm directly
+        # Prefix caching with vision embedding support
+        # Following LMCache approach: cache vision embeddings to skip encoder on hit
+        from mlx_vlm.models import cache as vlm_cache
+        from mlx_vlm.utils import prepare_inputs
+        import time
+
+        use_cache = kwargs.pop("use_cache", True)
+        cache_entry = None
+        prefix_match_len = 0
+        vision_embeddings = None
+        cache_hit = False
+
+        # Tokenize prompt for cache lookup
+        tokenizer = self.processor.tokenizer if hasattr(self.processor, 'tokenizer') else self.processor
+        token_ids = tokenizer.encode(formatted_prompt)
+
+        # Check prefix cache
+        if use_cache and self._cache_manager is not None and all_images:
+            try:
+                cache_entry, prefix_match_len = self._cache_manager.fetch(
+                    all_images, formatted_prompt, token_ids
+                )
+                if cache_entry:
+                    cache_hit = True
+                    vision_embeddings = cache_entry.vision_embeddings
+                    if vision_embeddings is not None:
+                        logger.info(f"[PREFIX CACHE] Vision embeddings cached - would skip encoder!")
+                    if prefix_match_len > 0:
+                        logger.info(f"[PREFIX CACHE] {prefix_match_len} prefix tokens match")
+            except Exception as e:
+                logger.warning(f"Cache fetch failed: {e}")
+
+        # Generate - use KV cache if available from previous identical request
+        start_time = time.time()
+
+        # Create or reuse prompt cache for prefix caching speedup
+        prompt_cache = None
+        skip_prompt_processing = False
+
+        if cache_hit and cache_entry and cache_entry.kv_cache:
+            # NOTE: For multimodal (MLLM) with images, we CANNOT use skip_prompt_processing
+            # because the vision encoder must run each time to provide visual context.
+            # The skip_prompt_processing path only calls language_model() which has no vision.
+            # Passing cached KV states doesn't help for MLLM since full forward pass overwrites them.
+            if all_images:
+                logger.info("[PREFIX CACHE] Cache hit but images present - full forward pass required (no speedup)")
+                # Create fresh cache - can't reuse for MLLM with images
+                prompt_cache = None
+                skip_prompt_processing = False
+            else:
+                # Text-only: can use skip_prompt_processing for maximum speedup
+                logger.info("[PREFIX CACHE] Text-only cache hit - using skip_prompt_processing speedup")
+                cached_prompt_cache = cache_entry.kv_cache
+                try:
+                    import copy
+                    prompt_cache = []
+                    for layer_cache in cached_prompt_cache:
+                        new_cache = copy.copy(layer_cache)
+                        if hasattr(layer_cache, 'state'):
+                            state = layer_cache.state
+                            if state is not None:
+                                import mlx.core as mx
+                                if len(state) >= 2 and state[0] is not None:
+                                    new_cache.keys = mx.array(state[0])
+                                    new_cache.values = mx.array(state[1])
+                                    if len(state) >= 3:
+                                        new_cache.offset = state[2]
+                                    elif hasattr(layer_cache, 'offset'):
+                                        new_cache.offset = layer_cache.offset
+                        prompt_cache.append(new_cache)
+                    skip_prompt_processing = True
+                    logger.info(f"[PREFIX CACHE] Skipping {prefix_match_len} token forward pass")
+                except Exception as e:
+                    logger.warning(f"[PREFIX CACHE] Failed to copy cache: {e}")
+                    prompt_cache = None
+                    skip_prompt_processing = False
+
+        if prompt_cache is None and self.model is not None:
+            # Create fresh cache
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
         result = generate(
             self.model,
             self.processor,
@@ -1112,8 +1191,58 @@ class MLXMultimodalLM:
             max_tokens=max_tokens,
             temp=temperature,
             verbose=False,
+            prompt_cache=prompt_cache,
+            skip_prompt_processing=skip_prompt_processing,
             **kwargs,
         )
+
+        # Store KV cache for future reuse (on cache miss)
+        # IMPORTANT: We need to store only the prompt portion, not generated tokens
+        if use_cache and self._cache_manager is not None and all_images and not cache_hit and prompt_cache:
+            try:
+                import copy
+                import mlx.core as mx
+
+                # Get prompt token count (before generation)
+                prompt_tokens_count = getattr(result, "prompt_tokens", 0)
+
+                # Deep copy the cache and trim to prompt tokens only
+                cache_to_store = []
+                for layer_cache in prompt_cache:
+                    new_cache = copy.copy(layer_cache)
+                    if hasattr(layer_cache, 'state'):
+                        state = layer_cache.state
+                        if state is not None and len(state) >= 2 and state[0] is not None:
+                            # Copy arrays
+                            keys = mx.array(state[0])
+                            values = mx.array(state[1])
+                            # Trim to prompt tokens only (not generated tokens)
+                            if hasattr(layer_cache, 'offset') and layer_cache.offset > prompt_tokens_count:
+                                # For caches with offset tracking, slice to prompt length
+                                new_cache.keys = keys[:, :, :prompt_tokens_count, :]
+                                new_cache.values = values[:, :, :prompt_tokens_count, :]
+                                new_cache.offset = prompt_tokens_count
+                            else:
+                                new_cache.keys = keys
+                                new_cache.values = values
+                                if len(state) >= 3:
+                                    new_cache.offset = state[2]
+                                elif hasattr(layer_cache, 'offset'):
+                                    new_cache.offset = min(layer_cache.offset, prompt_tokens_count)
+                    cache_to_store.append(new_cache)
+
+                self._cache_manager.store(
+                    images=all_images,
+                    prompt=formatted_prompt,
+                    vision_embeddings=None,
+                    kv_cache=cache_to_store,
+                    token_ids=token_ids,
+                    num_image_tokens=256,
+                    model_name=self.model_name,
+                )
+                logger.info(f"[PREFIX CACHE] Stored KV cache for {len(all_images)} image(s) ({prompt_tokens_count} prompt tokens)")
+            except Exception as e:
+                logger.warning(f"Failed to cache: {e}")
 
         # Handle GenerationResult object or plain string
         if hasattr(result, "text"):
@@ -1130,6 +1259,171 @@ class MLXMultimodalLM:
             finish_reason="stop",
             prompt_tokens=prompt_tokens,
             completion_tokens=generation_tokens,
+        )
+
+    def stream_chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> Iterator[MLLMOutput]:
+        """
+        Stream chat with OpenAI-compatible message format.
+
+        Supports multimodal content in messages:
+        - {"type": "text", "text": "..."}
+        - {"type": "image_url", "image_url": {"url": "..."}}
+        - {"type": "image_url", "image_url": {"url": "data:image/...;base64,..."}}
+
+        Args:
+            messages: List of chat messages (OpenAI format)
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            **kwargs: Additional parameters
+
+        Yields:
+            MLLMOutput with incremental text chunks
+        """
+        if not self._loaded:
+            self.load()
+
+        try:
+            from mlx_vlm import stream_generate
+            from mlx_vlm.prompt_utils import apply_chat_template
+        except ImportError:
+            # Fallback to non-streaming if stream_generate not available
+            output = self.chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            yield output
+            return
+
+        # Extract text and images from messages (same logic as chat())
+        images = []
+        videos = []
+        text_prompt = ""
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if isinstance(content, str):
+                if role == "user":
+                    text_prompt = content
+            elif isinstance(content, list):
+                # OpenAI multimodal format
+                for item in content:
+                    if isinstance(item, str):
+                        text_prompt += item
+                        continue
+
+                    # Convert Pydantic models to dicts
+                    if hasattr(item, "model_dump"):
+                        item = item.model_dump()
+                    elif hasattr(item, "dict"):
+                        item = item.dict()
+
+                    if isinstance(item, dict):
+                        item_type = item.get("type", "")
+
+                        if item_type == "text":
+                            text_prompt += item.get("text", "")
+
+                        elif item_type == "image_url":
+                            img_url = item.get("image_url", {})
+                            if isinstance(img_url, str):
+                                images.append(img_url)
+                            else:
+                                images.append(img_url.get("url", ""))
+
+                        elif item_type == "image":
+                            images.append(item.get("image", item.get("url", "")))
+
+                        elif item_type == "video":
+                            videos.append(item.get("video", item.get("url", "")))
+
+        # Process images
+        all_images = []
+        if images:
+            all_images.extend(self._prepare_images(images))
+
+        # Process videos
+        video_fps = kwargs.pop("video_fps", DEFAULT_FPS)
+        video_max_frames = kwargs.pop("video_max_frames", MAX_FRAMES)
+        for video_path in videos:
+            frames = self._prepare_video(
+                video_path, fps=video_fps, max_frames=video_max_frames
+            )
+            all_images.extend(frames)
+
+        # Apply chat template
+        try:
+            formatted_prompt = apply_chat_template(
+                self.processor,
+                self.config,
+                text_prompt,
+                num_images=len(all_images),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template: {e}, using raw prompt")
+            formatted_prompt = text_prompt
+
+        # Check cache for existing KV state (uses images as cache key)
+        from mlx_vlm.models import cache as vlm_cache
+        prompt_cache = None
+        cache_hit = False
+        use_cache = kwargs.pop("use_cache", True)
+
+        if use_cache and self._cache_manager is not None and all_images:
+            prompt_cache, cache_hit = self._cache_manager.fetch_cache(
+                all_images, formatted_prompt
+            )
+            if cache_hit:
+                logger.debug(f"Stream chat cache hit for {len(all_images)} image(s)")
+
+        # Create new cache if needed
+        if prompt_cache is None and self.model is not None:
+            try:
+                prompt_cache = vlm_cache.make_prompt_cache(self.model.language_model)
+            except Exception:
+                prompt_cache = None
+
+        # Stream generate tokens with cache
+        accumulated_text = ""
+        token_count = 0
+
+        for chunk in stream_generate(
+            self.model,
+            self.processor,
+            formatted_prompt,
+            all_images if all_images else None,
+            max_tokens=max_tokens,
+            temp=temperature,
+            prompt_cache=prompt_cache,
+            **kwargs,
+        ):
+            token_count += 1
+            # chunk is a GenerationResult with .text attribute containing the new token
+            new_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
+            accumulated_text += new_text
+
+            yield MLLMOutput(
+                text=new_text,  # Just the new token for streaming
+                finish_reason=None,
+                prompt_tokens=getattr(chunk, 'prompt_tokens', 0),
+                completion_tokens=token_count,
+            )
+
+        # Final yield with finish_reason
+        yield MLLMOutput(
+            text="",
+            finish_reason="stop",
+            prompt_tokens=getattr(chunk, 'prompt_tokens', 0) if 'chunk' in dir() else 0,
+            completion_tokens=token_count,
         )
 
     def describe_image(
@@ -1246,7 +1540,7 @@ class MLXMultimodalLM:
 
     def clear_cache(self) -> None:
         """Clear the VLM KV cache."""
-        if self._cache_manager:
+        if self._cache_manager is not None:
             self._cache_manager.clear()
             logger.info("VLM cache cleared")
 
@@ -1267,7 +1561,7 @@ class MLXMultimodalLM:
         if self.config:
             info["model_type"] = getattr(self.config, "model_type", "unknown")
 
-        if self._cache_manager:
+        if self._cache_manager is not None:
             info["cache_stats"] = self._cache_manager.get_stats()
 
         return info

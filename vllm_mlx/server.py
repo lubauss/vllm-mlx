@@ -52,39 +52,19 @@ from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 # Import from new modular API
-# Re-export for backwards compatibility with tests
-from .api.models import AssistantMessage  # noqa: F401
-from .api.models import ChatCompletionChoice  # noqa: F401
-from .api.models import ChatCompletionChunk  # noqa: F401
-from .api.models import ChatCompletionChunkChoice  # noqa: F401
-from .api.models import ChatCompletionChunkDelta  # noqa: F401
-from .api.models import ChatCompletionRequest
-from .api.models import ChatCompletionResponse
-from .api.models import CompletionChoice  # noqa: F401
-from .api.models import CompletionRequest
-from .api.models import CompletionResponse
-from .api.models import ContentPart  # noqa: F401
-from .api.models import ImageUrl  # noqa: F401
-from .api.models import MCPExecuteRequest
-from .api.models import MCPExecuteResponse
-from .api.models import MCPServerInfo  # noqa: F401
-from .api.models import MCPServersResponse
-from .api.models import MCPToolInfo  # noqa: F401
-from .api.models import MCPToolsResponse
-from .api.models import Message  # noqa: F401
-from .api.models import ModelInfo  # noqa: F401
-from .api.models import ModelsResponse
-from .api.models import Usage  # noqa: F401
-from .api.models import VideoUrl  # noqa: F401
-from .api.tool_calling import (
-    build_json_system_prompt,
-    convert_tools_for_template,
-    parse_json_output,
-    parse_tool_calls,
-)
-from .api.utils import clean_output_text, extract_multimodal_content
-from .api.utils import is_mllm_model  # noqa: F401
-from .engine import BaseEngine, BatchedEngine, SimpleEngine, GenerationOutput
+from .api.models import (  # Re-export for backwards compatibility with tests
+    AssistantMessage, ChatCompletionChoice, ChatCompletionChunk,
+    ChatCompletionChunkChoice, ChatCompletionChunkDelta, ChatCompletionRequest,
+    ChatCompletionResponse, CompletionChoice, CompletionRequest,
+    CompletionResponse, ContentPart, ImageUrl, MCPExecuteRequest,
+    MCPExecuteResponse, MCPServerInfo, MCPServersResponse, MCPToolInfo,
+    MCPToolsResponse, Message, ModelInfo, ModelsResponse, Usage, VideoUrl)
+from .api.tool_calling import (build_json_system_prompt,
+                               convert_tools_for_template, parse_json_output,
+                               parse_tool_calls)
+from .api.utils import (clean_output_text, extract_multimodal_content,
+                        is_mllm_model)
+from .engine import BaseEngine, BatchedEngine, SimpleEngine
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -282,21 +262,6 @@ def load_model(
         logger.info(f"{model_type} model loaded (simple mode): {model_name}")
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
-
-
-def get_usage(output: GenerationOutput) -> Usage:
-    """Extract usage metrics from GenerationOutput."""
-    total_prompt_tokens = (
-        output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
-    )
-    total_completion_tokens = (
-        output.completion_tokens if hasattr(output, "completion_tokens") else 0
-    )
-    return Usage(
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        total_tokens=total_prompt_tokens + total_completion_tokens,
-    )
 
 
 @app.get("/health")
@@ -577,7 +542,6 @@ async def create_completion(request: CompletionRequest):
     timeout = request.timeout or _default_timeout
     choices = []
     total_completion_tokens = 0
-    total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
         try:
@@ -604,23 +568,19 @@ async def create_completion(request: CompletionRequest):
             )
         )
         total_completion_tokens += output.completion_tokens
-        total_prompt_tokens += (
-            output.prompt_tokens if hasattr(output, "prompt_tokens") else 0
-        )
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Completion: {total_prompt_tokens} prompt + {total_completion_tokens} completion tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     return CompletionResponse(
         model=request.model,
         choices=choices,
         usage=Usage(
-            prompt_tokens=total_prompt_tokens,
             completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
+            total_tokens=total_completion_tokens,
         ),
     )
 
@@ -673,8 +633,32 @@ async def create_chat_completion(request: ChatCompletionRequest):
     """
     engine = get_engine()
 
-    # Extract text, images, and videos from messages
-    messages, images, videos = extract_multimodal_content(request.messages)
+    # For MLLM models, keep original messages with embedded images
+    # (MLLM.chat() extracts images from message content internally)
+    print(f"DEBUG: engine.is_mllm = {engine.is_mllm}")
+    if engine.is_mllm:
+        print("DEBUG: Taking MLLM path")
+        # Convert Pydantic messages to dicts preserving full content
+        messages = []
+        for msg in request.messages:
+            msg_dict = msg.model_dump() if hasattr(msg, 'model_dump') else dict(msg)
+            messages.append(msg_dict)
+        images, videos = [], []  # MLLM extracts these from messages
+        # Debug: log message structure
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.info(f"MLLM: Processing {len(messages)} messages")
+        for i, m in enumerate(messages):
+            c = m.get('content')
+            if isinstance(c, list):
+                _logger.info(f"  Msg {i}: role={m.get('role')}, content is list with {len(c)} items")
+                for j, item in enumerate(c):
+                    _logger.info(f"    Item {j}: {item.get('type') if isinstance(item, dict) else type(item)}")
+            else:
+                _logger.info(f"  Msg {i}: role={m.get('role')}, content is {type(c).__name__}")
+    else:
+        # For LLM, extract text, images, and videos separately
+        messages, images, videos = extract_multimodal_content(request.messages)
 
     has_media = bool(images or videos)
 
@@ -830,8 +814,6 @@ async def stream_completion(
                 }
             ],
         }
-        if output.finished:
-            data["usage"] = get_usage(output).model_dump()
         yield f"data: {json.dumps(data)}\n\n"
 
     yield "data: [DONE]\n\n"
@@ -845,6 +827,11 @@ async def stream_chat_completion(
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+
+    # Check if we should include usage in the final chunk
+    include_usage = (
+        request.stream_options and request.stream_options.include_usage
+    )
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
@@ -863,9 +850,21 @@ async def stream_chat_completion(
     is_thinking_model = "nemotron" in request.model.lower()
     think_prefix_sent = False
 
+    # Track token counts for usage reporting
+    prompt_tokens = 0
+    completion_tokens = 0
+    last_output = None
+
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
         content = output.new_text
+        last_output = output
+
+        # Track token counts from output (updated each chunk)
+        if hasattr(output, 'prompt_tokens') and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, 'completion_tokens') and output.completion_tokens:
+            completion_tokens = output.completion_tokens
 
         # Add <think> prefix on first content chunk for thinking models
         if is_thinking_model and not think_prefix_sent and content:
@@ -883,9 +882,22 @@ async def stream_chat_completion(
                     finish_reason=output.finish_reason if output.finished else None,
                 )
             ],
-            usage=get_usage(output) if output.finished else None,
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Send final chunk with usage if requested
+    if include_usage:
+        usage_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[],  # Empty choices for usage-only chunk
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+        yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
     yield "data: [DONE]\n\n"
 
@@ -900,7 +912,8 @@ async def init_mcp(config_path: str):
     global _mcp_manager, _mcp_executor
 
     try:
-        from vllm_mlx.mcp import MCPClientManager, ToolExecutor, load_mcp_config
+        from vllm_mlx.mcp import (MCPClientManager, ToolExecutor,
+                                  load_mcp_config)
 
         config = load_mcp_config(config_path)
         _mcp_manager = MCPClientManager(config)
@@ -911,7 +924,7 @@ async def init_mcp(config_path: str):
         logger.info(f"MCP initialized with {len(_mcp_manager.get_all_tools())} tools")
 
     except ImportError as e:
-        logger.error("MCP SDK not installed. Install with: pip install mcp")
+        logger.error(f"MCP SDK not installed. Install with: pip install mcp")
         raise
     except Exception as e:
         logger.error(f"Failed to initialize MCP: {e}")
