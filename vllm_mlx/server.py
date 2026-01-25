@@ -828,6 +828,11 @@ async def stream_chat_completion(
     """Stream chat completion response."""
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
+    # Check if we should include usage in the final chunk
+    include_usage = (
+        request.stream_options and request.stream_options.include_usage
+    )
+
     # First chunk with role
     first_chunk = ChatCompletionChunk(
         id=response_id,
@@ -845,9 +850,21 @@ async def stream_chat_completion(
     is_thinking_model = "nemotron" in request.model.lower()
     think_prefix_sent = False
 
+    # Track token counts for usage reporting
+    prompt_tokens = 0
+    completion_tokens = 0
+    last_output = None
+
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
         content = output.new_text
+        last_output = output
+
+        # Track token counts from output (updated each chunk)
+        if hasattr(output, 'prompt_tokens') and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, 'completion_tokens') and output.completion_tokens:
+            completion_tokens = output.completion_tokens
 
         # Add <think> prefix on first content chunk for thinking models
         if is_thinking_model and not think_prefix_sent and content:
@@ -867,6 +884,20 @@ async def stream_chat_completion(
             ],
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Send final chunk with usage if requested
+    if include_usage:
+        usage_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=request.model,
+            choices=[],  # Empty choices for usage-only chunk
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+        )
+        yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
     yield "data: [DONE]\n\n"
 
