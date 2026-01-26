@@ -43,6 +43,8 @@ dependencies = [
     "tabulate>=0.9.0",
     # Video processing for VLM
     "opencv-python>=4.8.0",
+    # Vision processor (required for transformers AutoProcessor)
+    "torchvision>=0.18.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
